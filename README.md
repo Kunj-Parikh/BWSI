@@ -1,0 +1,1 @@
+Github repo for BWSI CubeSat for team KnightSat
