@@ -38,7 +38,7 @@ def estimate_height(pixel_height, focal_length_px, distance_m):
     return (pixel_height * distance_m) / focal_length_px
 
 def capture_gray():
-    time.sleep(2)
+    time.sleep(120)
     yuv = picam2.capture_array()
     gray = yuv[:HEIGHT,:WIDTH]
     filename = f"Photos/photo_{int(time.time())}.png"
