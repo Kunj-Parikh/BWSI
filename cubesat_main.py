@@ -2,57 +2,67 @@ import time
 import os
 import cv2
 import numpy as np
-import bluetooth
+import socket
+import threading
+import queue
 from picamera2 import Picamera2
 
 WIDTH, HEIGHT         = 1024, 768
 DISTANCE_M            = 2.0
 FOCAL_LENGTH_PX       = 700
-CAPTURE_INTERVAL_S    = 120
+CAPTURE_INTERVAL_S    = 12
 STORAGE_LIMIT_MB      = 14000
 PHOTO_DIR             = "Photos"
-DOWNLINKED_LOG        = "downlinked.txt"
 LAPTOP_BT_MAC         = "70:D8:23:96:BA:DA"
 BLUETOOTH_CHANNEL     = 12
 
 picam2 = Picamera2()
 config = picam2.create_preview_configuration(
-    {'format': 'YUV420', 'size': (WIDTH, HEIGHT)}
+    main={"format": "BGR888", "size": (WIDTH, HEIGHT)}
 )
 picam2.configure(config)
 picam2.start()
+time.sleep(2)
 os.makedirs(PHOTO_DIR, exist_ok=True)
 orb = cv2.ORB_create()
 
-def send_via_bluetooth(filepath):
-    try:
-        sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
-        sock.connect((LAPTOP_BT_MAC, BLUETOOTH_CHANNEL))
-        with open(filepath, "rb") as f:
-            data = f.read()
-        filename = os.path.basename(filepath)
-        sock.send(f"{filename}:{len(data)}\n".encode())
-        sock.sendall(data)
-        sock.close()
-        mark_downlinked(filename)
-        print(f"[BT] Sent {filename}")
-        return True
-    except Exception as e:
-        print(f"[BT] Failed: {e}")
-        return False
+send_queue = queue.Queue()
 
-def send_all_pending():
-    downlinked = load_downlinked()
-    pending = [
-        f for f in sorted(os.listdir(PHOTO_DIR))
-        if f.endswith(".png")
-        and "_overlay" not in f
-        and "_height"  not in f
-        and "_matches" not in f
-        and f not in downlinked
-    ]
-    for fname in pending:
-        send_via_bluetooth(os.path.join(PHOTO_DIR, fname))
+def bluetooth_sender():
+    while True:
+        filepath = send_queue.get()
+        if not os.path.exists(filepath):
+            send_queue.task_done()
+            continue
+        success = False
+        for attempt in range(5):
+            try:
+                sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+                sock.settimeout(30)
+                sock.connect((LAPTOP_BT_MAC, BLUETOOTH_CHANNEL))
+                with open(filepath, "rb") as f:
+                    data = f.read()
+                filename = os.path.basename(filepath)
+                sock.send(f"{filename}:{len(data)}\n".encode())
+                sock.sendall(data)
+                sock.close()
+                print(f"[BT] Sent {filename}")
+                os.remove(filepath)
+                print(f"[BT] Deleted {filename}")
+                success = True
+                break
+            except Exception as e:
+                print(f"[BT] Attempt {attempt+1} failed: {e}")
+                time.sleep(3)
+        if not success:
+            print(f"[BT] Gave up on {filepath} — keeping file")
+        send_queue.task_done()
+
+sender_thread = threading.Thread(target=bluetooth_sender, daemon=True)
+sender_thread.start()
+
+def queue_file(filepath):
+    send_queue.put(filepath)
 
 def get_used_mb():
     total_bytes = sum(
@@ -62,41 +72,19 @@ def get_used_mb():
     )
     return total_bytes / (1024 * 1024)
 
-def load_downlinked():
-    if not os.path.exists(DOWNLINKED_LOG):
-        return set()
-    with open(DOWNLINKED_LOG) as fh:
-        return set(line.strip() for line in fh)
-
-def mark_downlinked(filename):
-    with open(DOWNLINKED_LOG, "a") as fh:
-        fh.write(filename + "\n")
-
-def purge_downlinked_images():
-    downlinked = load_downlinked()
-    candidates = sorted(
-        [f for f in os.listdir(PHOTO_DIR) if f in downlinked],
-        key=lambda f: os.path.getmtime(os.path.join(PHOTO_DIR, f))
-    )
-    for fname in candidates:
-        if get_used_mb() < STORAGE_LIMIT_MB:
-            break
-        os.remove(os.path.join(PHOTO_DIR, fname))
-
 def check_and_manage_storage():
     used = get_used_mb()
     if used >= STORAGE_LIMIT_MB:
-        purge_downlinked_images()
-        if get_used_mb() >= STORAGE_LIMIT_MB:
-            return False
+        print("[STORAGE] Full and nothing to purge — skipping capture")
+        return False
     return True
 
 def capture_gray():
-    time.sleep(CAPTURE_INTERVAL_S)
-    yuv  = picam2.capture_array()
-    gray = yuv[:HEIGHT, :WIDTH].copy()
+    frame    = picam2.capture_array()
+    gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     filename = os.path.join(PHOTO_DIR, f"photo_{int(time.time())}.png")
     cv2.imwrite(filename, gray)
+    print(f"[CAPTURE] Saved {filename} ({os.path.getsize(filename)/1024:.1f} KB)")
     return gray, filename
 
 def segment_light_shadow(gray):
@@ -126,7 +114,9 @@ def overlay_light_shadow(gray, light, shadow, filename):
     overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     overlay[light]  = [0, 255, 0]
     overlay[shadow] = [0, 0, 255]
-    cv2.imwrite(filename.replace(".png", "_overlay.png"), overlay)
+    out = filename.replace(".png", "_overlay.png")
+    cv2.imwrite(out, overlay)
+    return out
 
 def overlay_height(gray, light, pixel_height, height_m, filename):
     overlay  = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
@@ -136,21 +126,29 @@ def overlay_height(gray, light, pixel_height, height_m, filename):
         cv2.rectangle(overlay, (0, top), (gray.shape[1]-1, bottom), (255, 0, 0), 2)
         cv2.putText(overlay, f"{height_m:.2f}m", (10, max(top-10, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-    cv2.imwrite(filename.replace(".png", "_height.png"), overlay)
+    out = filename.replace(".png", "_height.png")
+    cv2.imwrite(out, overlay)
+    return out
 
 def overlay_matches(img1, img2, matches, k1, k2, filename):
     if not matches:
-        return
+        return None
     match_img = cv2.drawMatches(img1, k1, img2, k2, matches[:20], None, flags=2)
-    cv2.imwrite(filename.replace(".png", "_matches.png"), match_img)
+    out = filename.replace(".png", "_matches.png")
+    cv2.imwrite(out, match_img)
+    return out
 
 def main():
-    send_all_pending()
+    print("[MAIN] Starting — clearing old photos and taking first picture now")
+    for f in os.listdir(PHOTO_DIR):
+        os.remove(os.path.join(PHOTO_DIR, f))
+    print("[MAIN] Photos folder cleared")
+
     prev_gray = None
 
     while True:
         if not check_and_manage_storage():
-            time.sleep(60)
+            time.sleep(5)
             continue
 
         gray, filename = capture_gray()
@@ -159,16 +157,25 @@ def main():
         y_coords     = np.where(light)[0]
         pixel_height = int(y_coords.max() - y_coords.min()) if len(y_coords) > 0 else 0
         height_m     = estimate_height(pixel_height, FOCAL_LENGTH_PX, DISTANCE_M) if pixel_height > 0 else 0.0
+        print(f"[ANALYSIS] threshold={threshold} px_height={pixel_height} height={height_m:.3f}m")
 
-        overlay_light_shadow(gray, light, shadow, filename)
-        overlay_height(gray, light, pixel_height, height_m, filename)
+        overlay_file = overlay_light_shadow(gray, light, shadow, filename)
+        height_file  = overlay_height(gray, light, pixel_height, height_m, filename)
+
+        queue_file(filename)
+        queue_file(overlay_file)
+        queue_file(height_file)
 
         if prev_gray is not None:
             dx, dy, matches, k1, k2 = compare_images(prev_gray, gray)
-            overlay_matches(prev_gray, gray, matches, k1, k2, filename)
+            print(f"[MOTION] dx={dx:.2f} dy={dy:.2f} matches={len(matches)}")
+            matches_file = overlay_matches(prev_gray, gray, matches, k1, k2, filename)
+            if matches_file:
+                queue_file(matches_file)
 
-        send_via_bluetooth(filename)
         prev_gray = gray
+        print(f"[MAIN] Waiting {CAPTURE_INTERVAL_S}s until next capture...")
+        time.sleep(CAPTURE_INTERVAL_S)
 
 if __name__ == "__main__":
     main()

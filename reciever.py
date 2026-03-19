@@ -6,7 +6,7 @@ CHANNEL  = 12
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 server_sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
-server_sock.bind(("", CHANNEL))
+server_sock.bind(("70:D8:23:96:BA:DA", CHANNEL))
 server_sock.listen(1)
 print("Waiting for Pi to connect...")
 
