@@ -26,7 +26,6 @@ time.sleep(2)
 os.makedirs(PHOTO_DIR, exist_ok=True)
 orb = cv2.ORB_create()
 
-# Two queues — PSR files go in priority queue and get sent first
 normal_queue   = queue.Queue()
 priority_queue = queue.Queue()
 
@@ -207,7 +206,6 @@ def save_psr_overlay(gray, psr_map, cycle_number):
     cv2.imwrite(psr_filename, overlay)
     print(f"[PSR] {psr_percent:.1f}% of frame is PSR — saved as {os.path.basename(psr_filename)}")
 
-    # Also save a binary map as a numpy file — fulfills MR-2
     binary_filename = psr_filename.replace(".png", "_binary.npy")
     np.save(binary_filename, psr_map.astype(np.uint8))
     print(f"[PSR] Binary map saved: {os.path.basename(binary_filename)}")
@@ -227,16 +225,13 @@ def main():
     psr_cycle    = 0
 
     while True:
-        # Storage check
         if not check_and_manage_storage():
             time.sleep(5)
             continue
 
-        # SR-1: Capture image
         gray, filename = capture_gray()
         image_count += 1
 
-        # SR-2: Segment and store shadow mask for PSR stack
         threshold, light, shadow = segment_light_shadow(gray)
         y_coords     = np.where(light)[0]
         pixel_height = int(y_coords.max() - y_coords.min()) if len(y_coords) > 0 else 0
@@ -245,16 +240,13 @@ def main():
 
         shadow_masks.append(shadow)
 
-        # Generate overlays
         overlay_file = overlay_light_shadow(gray, light, shadow, filename)
         height_file  = overlay_height(gray, light, pixel_height, height_m, filename)
 
-        # MR-4 / COM: Queue normal files for downlink
         queue_file(filename)
         queue_file(overlay_file)
         queue_file(height_file)
 
-        # Motion comparison
         if prev_gray is not None:
             dx, dy, matches, k1, k2 = compare_images(prev_gray, gray)
             print(f"[MOTION] dx={dx:.2f} dy={dy:.2f} matches={len(matches)}")
@@ -262,7 +254,6 @@ def main():
             if matches_file:
                 queue_file(matches_file)
 
-        # MR-1 + MR-2: Every 3 images run PSR detection
         if image_count % 3 == 0:
             psr_cycle += 1
             print(f"[PSR] Running PSR detection — cycle {psr_cycle}...")
@@ -270,7 +261,6 @@ def main():
             if psr_map is not None:
                 psr_file, binary_file = save_psr_overlay(gray, psr_map, psr_cycle)
                 time.sleep(0.5)
-                # PSR files go to priority queue — sent before normal images
                 queue_psr_file(psr_file)
                 queue_psr_file(binary_file)
             shadow_masks = []
